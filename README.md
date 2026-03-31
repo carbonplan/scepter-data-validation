@@ -7,6 +7,16 @@
 uv sync --all-groups
 ```
 
+
+### Output data
+
+```python
+import geopandas as gpd 
+
+gdf = gpd.read_parquet('s3://carbonplan-carbon-removal/ew-workflows-data/valdation-data/sampled_locations.parquet')
+gdf
+```
+
 ### Data sources
 
 #### ISRIC
