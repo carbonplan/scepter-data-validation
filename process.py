@@ -29,12 +29,35 @@ def ERA5()->xr.Dataset:
 def GLDAS()->xr.Dataset:
     return xr.open_dataset('https://ldas.gsfc.nasa.gov/sites/default/files/ldas/gldas/SOILS/GLDASp5_porosity_025d.nc4', engine='h5netcdf', chunks="auto")
 
-def ISRIC()->xr.Dataset:
-    return xr.open_dataset(f'{PROTOCOL}{BUCKET}{VALIDATION_DATA_PREFIX}/ISRIC/wise_30sec_v1.tif', engine='rasterio', chunks="auto")
+ISRIC_VARS = ["BSAT", "CECS", "CECc", "ECEC", "PHAQ", "ORGC"]
+ISRIC_DEPTHS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7"]
+ISRIC_DEPTH_LABELS = ["0-20cm", "20-40cm", "40-60cm", "60-80cm", "80-100cm", "100-150cm", "150-200cm"]
+
+def ISRIC_raster() -> xr.DataArray:
+    return xr.open_dataset(
+        f'{PROTOCOL}{BUCKET}{VALIDATION_DATA_PREFIX}/ISRIC/wise_30sec_v1.tif',
+        engine='rasterio', chunks="auto"
+    )['band_data'].squeeze('band')
+
+def ISRIC_tables() -> tuple[pd.Series, dict]:
+    """We need the lookup tables for location the vars. Read our TSV"""
+    tsv = pd.read_csv(
+        f'{PROTOCOL}{BUCKET}{VALIDATION_DATA_PREFIX}/ISRIC/wise_30sec_v1.tsv', sep='\t'
+    ).rename(columns={'pixel_vaue': 'pixel_value'})
+    pixel_to_newsuid = tsv.set_index('pixel_value')['description']
+
+    depth_tables = {}
+    for d, label in zip(ISRIC_DEPTHS, ISRIC_DEPTH_LABELS):
+        df = pd.read_csv(
+            f'{PROTOCOL}{BUCKET}{VALIDATION_DATA_PREFIX}/ISRIC/HW30s_w{d}.txt', quotechar='"'
+        )
+        depth_tables[label] = df.set_index('NEWSUID')[ISRIC_VARS]
+
+    return pixel_to_newsuid, depth_tables
 
 
 def MODIS(MODIS_YEAR: int = 2000) ->xr.Dataset:
-    return xr.open_dataset(f'http://files.ntsg.umt.edu/data/NTSG_Products/MOD17/GeoTIFF/MOD17A3/GeoTIFF_30arcsec/MOD17A3_Science_GPP_{MODIS_YEAR}.tif', engine='rasterio', chunks="auto")
+    return xr.open_dataset(f'http://files.ntsg.umt.edu/data/NTSG_Products/MOD17/GeoTIFF/MOD17A3/GeoTIFF_30arcsec/MOD17A3_Science_NPP_{MODIS_YEAR}.tif', engine='rasterio', chunks="auto")
 
 
 def SOILGRIDS()->xr.Dataset:
@@ -43,7 +66,7 @@ def SOILGRIDS()->xr.Dataset:
     registry = ObjectStoreRegistry({bucket_url: s3_store})
     parser = VirtualTIFF(ifd=0)
 
-    variables = ['phh2o', 'soc', 'bdod']
+    variables = ['phh2o', 'soc', 'bdod', 'cec']
     depths = ['0-5cm', '5-15cm', '15-30cm', '30-60cm', '60-100cm', '100-200cm']
 
     def _open_manifest(var, depth, res=5000):
@@ -93,12 +116,15 @@ def main() -> gpd.GeoDataFrame:
         method='nearest',
     ).compute().values
 
-    isric_ds = ISRIC()
-    isric_sampled = isric_ds['band_data'].isel(band=0).sel(
+    # ISRIC — sample raster for SMU codes, then join property tables by depth
+    isric_raster = ISRIC_raster()
+    pixel_to_newsuid, depth_tables = ISRIC_tables()
+    pixel_vals = isric_raster.sel(
         x=xr.DataArray(df.lon.values, dims='points'),
         y=xr.DataArray(df.lat.values, dims='points'),
         method='nearest',
-    ).compute().values
+    ).compute().values.astype(int)
+    newsuids = pixel_to_newsuid.reindex(pixel_vals).values
 
     modis_ds = MODIS()
     modis_sampled = modis_ds['band_data'].isel(band=0).sel(
@@ -120,15 +146,20 @@ def main() -> gpd.GeoDataFrame:
         .to_dataframe()
         .unstack('depth')
     )
-    soilgrids_df.columns = [f"{var}_{depth}" for var, depth in soilgrids_df.columns]
+    soilgrids_df.columns = [f"SoilGrids_{var}_{depth}" for var, depth in soilgrids_df.columns]
     soilgrids_df = soilgrids_df.reset_index(drop=True)
+
+    isric_df = pd.DataFrame(index=range(len(df)))
+    for depth_label, props_df in depth_tables.items():
+        joined = props_df.reindex(newsuids).reset_index(drop=True)
+        for var in ISRIC_VARS:
+            isric_df[f'ISRIC_{var}_{depth_label}'] = joined[var].values
 
     result = df.copy()
     result['ERA5_stl1'] = era5_sampled
-    result['GLDAS_porosity'] = gldas_sampled
-    result['ISRIC'] = isric_sampled
-    result['MODIS_GPP'] = modis_sampled
-    result = pd.concat([result, soilgrids_df], axis=1)
+    result['soil_porosity_GLDAS'] = gldas_sampled
+    result['MODIS_NPP'] = modis_sampled
+    result = pd.concat([result, soilgrids_df, isric_df], axis=1)
 
     gdf = gpd.GeoDataFrame(
         result,
